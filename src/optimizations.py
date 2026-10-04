@@ -52,6 +52,7 @@ Deviations from the paper, both configurable (see ``CombinationSpec``):
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -198,14 +199,44 @@ class CombinationResult:
 
 
 # --- Input preparation ---------------------------------------------------------
-def prepare_panel(var_frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str], int]:
+#: Columns produced by the combination methods themselves.  They must never be
+#: fed back in as inputs -- doing so silently combines the combinations.
+COMBINATION_NAMES = ("CQOM", "CCOM")
+
+
+def standalone_columns(var_frame: pd.DataFrame) -> list[str]:
+    """VaR columns that are model inputs, excluding combination outputs."""
+    excluded = {f"{VAR_COLUMN_PREFIX}{n}" for n in COMBINATION_NAMES}
+    return [
+        c
+        for c in var_frame.columns
+        if c.startswith(VAR_COLUMN_PREFIX) and c not in excluded
+    ]
+
+
+def prepare_panel(
+    var_frame: pd.DataFrame, model_columns: list[str] | None = None
+) -> tuple[pd.DataFrame, list[str], int]:
     """Drop rows with any missing VaR/return and return the clean panel.
 
     The rolling engine emits no forecast until the estimation window is full, so
     the only NaNs here come from failed GARCH fits; either way they are dropped
     and counted.
+
+    ``model_columns`` pins which VaR columns are treated as inputs.  Left as
+    None the behaviour is unchanged (every VaR column is an input), which is what
+    the stand-alone panel wants; the rolling engine passes the stand-alone
+    columns explicitly so that a panel which already carries VaR_CQOM/VaR_CCOM
+    cannot feed those outputs back in as regressors.
     """
-    cols = [c for c in var_frame.columns if c.startswith(VAR_COLUMN_PREFIX)]
+    cols = (
+        list(model_columns)
+        if model_columns is not None
+        else [c for c in var_frame.columns if c.startswith(VAR_COLUMN_PREFIX)]
+    )
+    missing_cols = [c for c in cols if c not in var_frame.columns]
+    if missing_cols:
+        raise CombinationError(f"missing VaR column(s): {missing_cols}")
     if not cols:
         raise CombinationError("no VaR columns found in the input frame")
     if ACTUAL_COLUMN not in var_frame.columns:
@@ -218,8 +249,14 @@ def prepare_panel(var_frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str], int
     return clean, model_names, before - len(clean)
 
 
-def _design(panel: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, pd.Series]:
-    cols = [c for c in panel.columns if c.startswith(VAR_COLUMN_PREFIX)]
+def _design(
+    panel: pd.DataFrame, model_columns: list[str] | None = None
+) -> tuple[np.ndarray, np.ndarray, pd.Series]:
+    cols = (
+        list(model_columns)
+        if model_columns is not None
+        else [c for c in panel.columns if c.startswith(VAR_COLUMN_PREFIX)]
+    )
     X = panel[cols].to_numpy(dtype=float)
     y = panel[ACTUAL_COLUMN].to_numpy(dtype=float)
     dates = pd.to_datetime(panel[DATE_COLUMN]) if DATE_COLUMN in panel else pd.Series(panel.index)
@@ -227,11 +264,36 @@ def _design(panel: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, pd.Series]:
 
 
 # --- CQOM ----------------------------------------------------------------------
+def _cqom_params(
+    X: np.ndarray, y: np.ndarray, spec: CombinationSpec, alpha: float
+) -> np.ndarray:
+    """Array-level CQOM core: solve the quantile regression, return free params.
+
+    Factored out of :func:`fit_cqom` so the rolling engine can call it directly
+    on NumPy slices instead of rebuilding and re-validating a DataFrame on every
+    one of a few thousand estimation windows.
+    """
+    if spec.sum_to_one:
+        design = X[:, :-1] - X[:, [-1]]
+        target = y - X[:, -1]
+    else:
+        design = X
+        target = y
+    if spec.include_intercept:
+        design = np.column_stack([np.ones(len(design)), design])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = QuantReg(target, design).fit(q=alpha)
+    return np.asarray(fit.params, dtype=float)
+
+
 def fit_cqom(
     var_frame: pd.DataFrame,
     alpha: float = ALPHA,
     include_intercept: bool = False,
     sum_to_one: bool = False,
+    model_columns: list[str] | None = None,
 ) -> CombinationResult:
     """Conditional Quantile Optimization Method (eq. 2.8).
 
@@ -240,8 +302,8 @@ def fit_cqom(
     regressing (r - VaR_k) on the differences (VaR_j - VaR_k), so the result is
     still a single unconstrained quantile regression.
     """
-    panel, model_names, _ = prepare_panel(var_frame)
-    X, y, dates = _design(panel)
+    panel, model_names, _ = prepare_panel(var_frame, model_columns)
+    X, y, dates = _design(panel, model_columns)
     spec = CombinationSpec(X.shape[1], include_intercept, sum_to_one)
 
     if len(panel) <= spec.n_free:
@@ -249,20 +311,7 @@ def fit_cqom(
             f"CQOM needs more observations ({len(panel)}) than parameters ({spec.n_free})"
         )
 
-    if sum_to_one:
-        design = X[:, :-1] - X[:, [-1]]
-        target = y - X[:, -1]
-    else:
-        design = X
-        target = y
-    if include_intercept:
-        design = np.column_stack([np.ones(len(design)), design])
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fit = QuantReg(target, design).fit(q=alpha)
-
-    params = np.asarray(fit.params, dtype=float)
+    params = _cqom_params(X, y, spec, alpha)
     intercept, weights = spec.unpack(params)
     combined = combine(X, intercept, weights)
     diag = hit_diagnostics(hit_sequence(y, combined), alpha)
@@ -324,65 +373,31 @@ def default_bandwidth(y: np.ndarray) -> float:
     return scale * S ** (-1.0 / 3.0)
 
 
-def fit_ccom(
-    var_frame: pd.DataFrame,
-    alpha: float = ALPHA,
-    include_intercept: bool = False,
-    sum_to_one: bool = False,
-    bandwidth: float | None = None,
-    method: str = "Nelder-Mead",
-    extra_starts: list[np.ndarray] | None = None,
-    maxiter: int = 20000,
-    bandwidth_path: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125),
-) -> CombinationResult:
-    """Conditional Coverage Optimization Method (eq. 2.7).
+def _ccom_params(
+    X: np.ndarray,
+    y: np.ndarray,
+    spec: CombinationSpec,
+    alpha: float,
+    h: float,
+    optimize_from: list[np.ndarray],
+    evaluate_only: list[np.ndarray],
+    bandwidth_path: tuple[float, ...],
+    method: str,
+    maxiter: int,
+) -> tuple[np.ndarray, float, float, bool, int]:
+    """Array-level CCOM core.
 
-    Minimizes psi' psi over the loading vector with ``scipy.optimize.minimize``,
-    from several deterministic starting points to guard against the local-minimum
-    problem the paper flags.
+    Splits the candidate set in two, which is what makes a rolling re-fit
+    affordable.  ``optimize_from`` points are expensive -- each one runs the
+    optimizer once per bandwidth leg.  ``evaluate_only`` points are nearly free:
+    scoring a weight vector is just a hit-sequence count.  Keeping the
+    single-model vectors e_j in ``evaluate_only`` preserves the guarantee that
+    CCOM is never worse than the best stand-alone forecast, without paying to
+    optimize from each of them on every one of a few thousand windows.
 
-    Two refinements are needed because the smoothed surrogate is not the
-    estimator:
-
-    * **Bandwidth continuation.** The optimizer is run along a decreasing
-      sequence of bandwidths, warm-starting each leg, following the paper's
-      h_T -> 0 asymptotics.  A single coarse h leaves a wide flat basin in which
-      many weight vectors look equally optimal.
-    * **Selection on the discrete objective.** Eq. 2.7 defines the estimator as
-      the argmin of psi' psi built from the *true* indicator; smoothing is only a
-      numerical device.  Every candidate visited -- including each starting point,
-      so that the single-model vectors e_j are always in the feasible set -- is
-      therefore scored on the discrete objective, with the finest-bandwidth
-      smoothed value as the tie-break.  This also makes CCOM no worse than the
-      best stand-alone forecast by construction, since e_j is always feasible
-      (it satisfies the sum-to-one restriction too).
+    Returns ``(params, discrete_objective, smoothed_objective, any_success,
+    n_candidates)``.
     """
-    panel, model_names, _ = prepare_panel(var_frame)
-    X, y, dates = _design(panel)
-    k = X.shape[1]
-    spec = CombinationSpec(k, include_intercept, sum_to_one)
-
-    if len(panel) <= spec.n_free:
-        raise CombinationError(
-            f"CCOM needs more observations ({len(panel)}) than parameters ({spec.n_free})"
-        )
-
-    h = default_bandwidth(y) if bandwidth is None else float(bandwidth)
-
-    # Deterministic starts: equal weights, each model alone, and the CQOM solution.
-    starts: list[np.ndarray] = [spec.pack(0.0, np.full(k, 1.0 / k))]
-    for j in range(k):
-        w = np.zeros(k)
-        w[j] = 1.0
-        starts.append(spec.pack(0.0, w))
-    try:
-        cq = fit_cqom(var_frame, alpha, include_intercept, sum_to_one)
-        starts.append(spec.pack(cq.intercept, cq.weights))
-    except CombinationError:
-        pass
-    if extra_starts:
-        starts.extend(np.asarray(s, dtype=float) for s in extra_starts)
-
     options = (
         {"maxiter": maxiter, "xatol": 1e-10, "fatol": 1e-14}
         if method == "Nelder-Mead"
@@ -399,11 +414,16 @@ def fit_ccom(
 
     candidates: list[np.ndarray] = []
     any_success = False
-    for x0 in starts:
+    for vec in evaluate_only:
+        vec = np.asarray(vec, dtype=float).ravel()
+        if vec.size == spec.n_free:
+            candidates.append(vec)
+
+    for x0 in optimize_from:
         x0 = np.asarray(x0, dtype=float).ravel()
         if x0.size != spec.n_free:
             continue
-        candidates.append(x0)          # the start itself is feasible
+        candidates.append(x0)
         current = x0
         for multiplier in bandwidth_path:
             with warnings.catch_warnings():
@@ -428,6 +448,84 @@ def fit_ccom(
     if not scored:
         raise CombinationError("CCOM optimization produced no finite solution")
     best_discrete, best_smoothed, best_params = min(scored, key=lambda s: (s[0], s[1]))
+    return best_params, best_discrete, best_smoothed, any_success, len(scored)
+
+
+def _ccom_default_candidates(spec: CombinationSpec, k: int) -> list[np.ndarray]:
+    """Equal weights plus each single-model vector e_j, all always feasible."""
+    out = [spec.pack(0.0, np.full(k, 1.0 / k))]
+    for j in range(k):
+        w = np.zeros(k)
+        w[j] = 1.0
+        out.append(spec.pack(0.0, w))
+    return out
+
+
+def fit_ccom(
+    var_frame: pd.DataFrame,
+    alpha: float = ALPHA,
+    include_intercept: bool = False,
+    sum_to_one: bool = False,
+    bandwidth: float | None = None,
+    method: str = "Nelder-Mead",
+    extra_starts: list[np.ndarray] | None = None,
+    maxiter: int = 20000,
+    bandwidth_path: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125),
+    model_columns: list[str] | None = None,
+) -> CombinationResult:
+    """Conditional Coverage Optimization Method (eq. 2.7).
+
+    Minimizes psi' psi over the loading vector with ``scipy.optimize.minimize``,
+    from several deterministic starting points to guard against the local-minimum
+    problem the paper flags.
+
+    Two refinements are needed because the smoothed surrogate is not the
+    estimator:
+
+    * **Bandwidth continuation.** The optimizer is run along a decreasing
+      sequence of bandwidths, warm-starting each leg, following the paper's
+      h_T -> 0 asymptotics.  A single coarse h leaves a wide flat basin in which
+      many weight vectors look equally optimal.
+    * **Selection on the discrete objective.** Eq. 2.7 defines the estimator as
+      the argmin of psi' psi built from the *true* indicator; smoothing is only a
+      numerical device.  Every candidate visited -- including each starting point,
+      so that the single-model vectors e_j are always in the feasible set -- is
+      therefore scored on the discrete objective, with the finest-bandwidth
+      smoothed value as the tie-break.  This also makes CCOM no worse than the
+      best stand-alone forecast by construction, since e_j is always feasible
+      (it satisfies the sum-to-one restriction too).
+    """
+    panel, model_names, _ = prepare_panel(var_frame, model_columns)
+    X, y, dates = _design(panel, model_columns)
+    k = X.shape[1]
+    spec = CombinationSpec(k, include_intercept, sum_to_one)
+
+    if len(panel) <= spec.n_free:
+        raise CombinationError(
+            f"CCOM needs more observations ({len(panel)}) than parameters ({spec.n_free})"
+        )
+
+    h = default_bandwidth(y) if bandwidth is None else float(bandwidth)
+
+    # Deterministic starts: equal weights, each model alone, and the CQOM solution.
+    starts: list[np.ndarray] = _ccom_default_candidates(spec, k)
+    try:
+        cq_params = _cqom_params(X, y, spec, alpha)
+        starts.append(cq_params)
+    except Exception:
+        pass
+    if extra_starts:
+        starts.extend(np.asarray(v, dtype=float) for v in extra_starts)
+
+    best_params, best_discrete, best_smoothed, any_success, n_scored = _ccom_params(
+        X, y, spec, alpha, h,
+        optimize_from=starts,
+        evaluate_only=[],
+        bandwidth_path=bandwidth_path,
+        method=method,
+        maxiter=maxiter,
+    )
+    h_fine = h * min(bandwidth_path)
 
     intercept, weights = spec.unpack(best_params)
     combined = combine(X, intercept, weights)
@@ -437,7 +535,7 @@ def fit_ccom(
     diag["bandwidth"] = h
     diag["bandwidth_fine"] = h_fine
     diag["n_starts"] = float(len(starts))
-    diag["n_candidates"] = float(len(scored))
+    diag["n_candidates"] = float(n_scored)
 
     return CombinationResult(
         name="CCOM",
@@ -454,6 +552,189 @@ def fit_ccom(
             f"method of moments, {method}, logistic smoothing "
             f"h={h:.3e}->{h_fine:.3e}, selected on discrete psi'psi"
         ),
+    )
+
+
+# --- Rolling (dynamic) weight calibration --------------------------------------
+@dataclass
+class RollingCombinationResult:
+    """Output of a rolling re-calibration run."""
+
+    var_frame: pd.DataFrame        # panel + one combined VaR column per method
+    weights: pd.DataFrame          # long: date, method, model, weight
+    window: int
+    alpha: float
+    model_names: list[str]
+    failures: dict[str, int] = field(default_factory=dict)
+    #: Days whose combined VaR came out >= 0 -- economically meaningless for a
+    #: long position, and a direct symptom of unstable loadings.
+    invalid: dict[str, int] = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
+
+    def weight_history(self, method: str) -> pd.DataFrame:
+        """Wide weight path for one method, for plotting the loading sequence."""
+        sub = self.weights[self.weights["method"] == method]
+        return sub.pivot(index=DATE_COLUMN, columns="model", values="weight")
+
+    def weight_summary(self) -> pd.DataFrame:
+        """Mean / sd / range of each loading, per method."""
+        g = self.weights.groupby(["method", "model"])["weight"]
+        return pd.DataFrame(
+            {"mean": g.mean(), "sd": g.std(), "min": g.min(), "max": g.max()}
+        ).reset_index()
+
+
+def rolling_combination_forecasts(
+    var_frame: pd.DataFrame,
+    window: int = WINDOW,
+    alpha: float = ALPHA,
+    methods: tuple[str, ...] = COMBINATION_NAMES,
+    include_intercept: bool = False,
+    sum_to_one: bool = False,
+    model_columns: list[str] | None = None,
+    warm_start: bool = False,
+    ccom_bandwidth_path: tuple[float, ...] = (1.0, 0.25),
+    ccom_maxiter: int = 4000,
+    progress_every: int = 0,
+) -> RollingCombinationResult:
+    """Re-calibrate the combination weights on a rolling window, every day.
+
+    For each target date ``d_t`` the weights are estimated on rows
+    ``[t - window, t)`` -- ending at ``t - 1`` -- and then applied to the
+    stand-alone VaR vector *at* ``t``.  Since those stand-alone forecasts are
+    themselves built only from returns before ``t`` (see
+    ``var_models.rolling_var_forecasts``), the combined VaR at ``t`` uses no
+    information from ``t`` or later.
+
+    This replaces the previous static scheme, in which a single weight vector
+    estimated once over the whole panel was applied to every day, and so could
+    not respond to a regime shift.
+
+    ``warm_start`` seeds each CCOM re-fit from the previous day's solution.  It
+    defaults to **False**, which is measured, not assumed: on this sample a warm
+    start made CCOM materially worse (crash-period violation rate 6.67% vs 2.38%
+    cold; peak loading norm 156 vs 80) *and* slower (406s vs 249s).  The CCOM
+    objective at p = 0.01 is riddled with ties, so a warm start keeps winning
+    tie-breaks and the loading vector ratchets into a stale region instead of
+    tracking the data.  It is kept as an option for experimentation only.
+
+    The single-model vectors e_j are in the candidate set every day as
+    *evaluate-only* points, so the guarantee that CCOM is never worse than the
+    best stand-alone forecast on its own objective is preserved at low cost.
+    """
+    cols = model_columns if model_columns is not None else standalone_columns(var_frame)
+    panel, model_names, _ = prepare_panel(var_frame, cols)
+    X, y, dates = _design(panel, cols)
+    n, k = X.shape
+    spec = CombinationSpec(k, include_intercept, sum_to_one)
+
+    if window <= spec.n_free:
+        raise CombinationError(
+            f"window ({window}) must exceed the number of parameters ({spec.n_free})"
+        )
+    if n <= window:
+        raise CombinationError(
+            f"need more than {window} rows to roll, got {n}"
+        )
+
+    unknown = set(methods) - set(COMBINATION_NAMES)
+    if unknown:
+        raise CombinationError(f"unknown method(s): {sorted(unknown)}")
+
+    out = panel.copy()
+    var_cols = {m: f"{VAR_COLUMN_PREFIX}{m}" for m in methods}
+    for col in var_cols.values():
+        out[col] = np.nan
+
+    failures = {m: 0 for m in methods}
+    invalid = {m: 0 for m in methods}
+    previous: dict[str, np.ndarray | None] = {m: None for m in methods}
+    weight_rows: list[dict[str, object]] = []
+    started = time.perf_counter()
+
+    for t in range(window, n):
+        Xw, yw = X[t - window : t], y[t - window : t]   # rows t-window .. t-1
+        x_t = X[t]
+        h = default_bandwidth(yw)
+
+        cq_params: np.ndarray | None = None
+        for method_name in methods:
+            params: np.ndarray | None = None
+            try:
+                if method_name == "CQOM":
+                    params = _cqom_params(Xw, yw, spec, alpha)
+                    cq_params = params
+                else:
+                    if cq_params is None:
+                        try:
+                            cq_params = _cqom_params(Xw, yw, spec, alpha)
+                        except Exception:
+                            cq_params = None
+                    # Cheap feasible points: single models and equal weights.
+                    evaluate_only = _ccom_default_candidates(spec, k)
+                    if cq_params is not None:
+                        evaluate_only.append(cq_params)
+                    # Expensive points: warm start, falling back to CQOM/equal.
+                    starts: list[np.ndarray] = []
+                    if warm_start and previous[method_name] is not None:
+                        starts.append(previous[method_name])
+                    if cq_params is not None:
+                        starts.append(cq_params)
+                    if not starts:
+                        starts.append(spec.pack(0.0, np.full(k, 1.0 / k)))
+                    params, *_ = _ccom_params(
+                        Xw, yw, spec, alpha, h,
+                        optimize_from=starts,
+                        evaluate_only=evaluate_only,
+                        bandwidth_path=ccom_bandwidth_path,
+                        method="Nelder-Mead",
+                        maxiter=ccom_maxiter,
+                    )
+            except Exception:
+                params = None
+
+            if params is None or not np.all(np.isfinite(params)):
+                failures[method_name] += 1
+                continue
+
+            previous[method_name] = np.asarray(params, dtype=float).copy()
+            intercept, weights = spec.unpack(params)
+            combined_t = float(intercept + x_t @ weights)
+            if combined_t >= 0.0:
+                invalid[method_name] += 1
+            out.loc[t, var_cols[method_name]] = combined_t
+
+            if include_intercept:
+                weight_rows.append(
+                    {DATE_COLUMN: dates.iloc[t], "method": method_name,
+                     "model": "intercept", "weight": float(intercept)}
+                )
+            for name, w in zip(model_names, weights):
+                weight_rows.append(
+                    {DATE_COLUMN: dates.iloc[t], "method": method_name,
+                     "model": name, "weight": float(w)}
+                )
+
+        if progress_every and ((t - window + 1) % progress_every == 0 or t == n - 1):
+            done, total = t - window + 1, n - window
+            print(
+                f"  .. {done}/{total} re-calibrations "
+                f"({time.perf_counter() - started:.1f}s)",
+                flush=True,
+            )
+
+    # Rows before the first full window carry no combined forecast.
+    out = out.iloc[window:].reset_index(drop=True)
+
+    return RollingCombinationResult(
+        var_frame=out,
+        weights=pd.DataFrame(weight_rows),
+        window=window,
+        alpha=alpha,
+        model_names=model_names,
+        failures=failures,
+        invalid=invalid,
+        elapsed_seconds=time.perf_counter() - started,
     )
 
 
@@ -514,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-days", type=int, default=800)
     parser.add_argument("--window", type=int, default=WINDOW)
     parser.add_argument("--alpha", type=float, default=ALPHA)
+    parser.add_argument("--combination-window", type=int, default=WINDOW,
+                        help="rolling window for dynamic weight re-calibration")
     args = parser.parse_args(argv)
 
     print("=" * 72)
@@ -587,9 +870,70 @@ def main(argv: list[str] | None = None) -> int:
     except CombinationError as exc:
         print(f"  CQOM on S=50 failed as expected: {exc}")
 
+    print(f"\n[stage 4] DYNAMIC weights: rolling {args.combination_window}-day re-calibration")
+    rolled = rolling_combination_forecasts(
+        panel, window=args.combination_window, alpha=args.alpha, progress_every=150
+    )
+    rf = rolled.var_frame
+    print(f"  re-calibrations   : {len(rf)} in {rolled.elapsed_seconds:.1f}s")
+    print(f"  failures          : {rolled.failures}")
+    print("\n  weight dispersion across the rolling path:")
+    print(rolled.weight_summary().to_string(index=False, float_format=lambda v: f"{v:9.3f}"))
+    for name in COMBINATION_NAMES:
+        col = f"{VAR_COLUMN_PREFIX}{name}"
+        d = hit_diagnostics(
+            hit_sequence(rf[ACTUAL_COLUMN].to_numpy(), rf[col].to_numpy()), args.alpha
+        )
+        print(f"  {name}: hit rate {d['hit_rate']:.3%} ({int(d['n_hits'])}/{int(d['n_obs'])})")
+
     print("\n[sanity checks]")
     ok = True
     cq, cc = results["CQOM"], results["CCOM"]
+
+    # --- rolling-path checks ---
+    X_all = panel[standalone_columns(panel)].to_numpy(dtype=float)
+    y_all = panel[ACTUAL_COLUMN].to_numpy(dtype=float)
+    spec_free = CombinationSpec(X_all.shape[1], False, False)
+    probe = args.combination_window + 7
+    manual = float(
+        _cqom_params(
+            X_all[probe - args.combination_window : probe],
+            y_all[probe - args.combination_window : probe],
+            spec_free,
+            args.alpha,
+        )
+        @ X_all[probe]
+    )
+    ok &= _check(
+        "rolling CQOM reproducible from [t-window, t-1] only (no lookahead)",
+        np.isclose(manual, float(rf[f"{VAR_COLUMN_PREFIX}CQOM"].iloc[7])),
+    )
+    ok &= _check(
+        "rolling output starts exactly one window in",
+        len(rf) == len(panel) - args.combination_window,
+    )
+    ok &= _check("rolling path produced no failures", sum(rolled.failures.values()) == 0)
+    comb_cols = [f"{VAR_COLUMN_PREFIX}{n}" for n in COMBINATION_NAMES]
+    n_nonneg = int((rf[comb_cols] >= 0).sum().sum())
+    invalid_rate = n_nonneg / float(len(rf) * len(comb_cols))
+    print(f"  (economically invalid VaR >= 0 on {n_nonneg} model-days, "
+          f"{invalid_rate:.3%}; per method {rolled.invalid})")
+    ok &= _check(
+        f"rolling combined VaR >= 0 on under 1% of model-days ({invalid_rate:.3%})",
+        invalid_rate < 0.01,
+    )
+    ok &= _check(
+        "no rolling combined VaR below -50%",
+        bool((rf[comb_cols] > -0.5).all().all()),
+    )
+    ok &= _check(
+        "weights actually vary over time (not silently static)",
+        float(rolled.weights.groupby(["method", "model"])["weight"].std().max()) > 1e-8,
+    )
+    ok &= _check(
+        "combination outputs are excluded from their own inputs",
+        set(standalone_columns(rf)) == set(standalone_columns(panel)),
+    )
     ok &= _check("CQOM converged", cq.converged)
     ok &= _check("CCOM converged", cc.converged)
     ok &= _check("CQOM weights all finite", bool(np.all(np.isfinite(cq.weights))))

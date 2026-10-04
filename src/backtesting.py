@@ -51,7 +51,12 @@ from scipy.stats import binom, chi2
 
 try:
     from data_loader import DATE_COLUMN, load_returns
-    from optimizations import combined_frame, fit_combinations, prepare_panel
+    from optimizations import (
+        combined_frame,
+        fit_combinations,
+        prepare_panel,
+        rolling_combination_forecasts,
+    )
     from var_models import (
         ACTUAL_COLUMN,
         ALPHA,
@@ -63,7 +68,12 @@ try:
 except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from data_loader import DATE_COLUMN, load_returns
-    from optimizations import combined_frame, fit_combinations, prepare_panel
+    from optimizations import (
+        combined_frame,
+        fit_combinations,
+        prepare_panel,
+        rolling_combination_forecasts,
+    )
     from var_models import (
         ACTUAL_COLUMN,
         ALPHA,
@@ -75,6 +85,8 @@ except ImportError:  # pragma: no cover
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = PROJECT_ROOT / "data"
+
+COMBINATION_WINDOW = 250   # rolling window for dynamic CQOM/CCOM weight calibration
 
 # Basel Committee (1996) traffic-light cut-offs for S = 250, p = 0.01.
 BASEL_WINDOW = 250
@@ -427,6 +439,14 @@ def _cache_path(test_days: int | None, window: int, alpha: float) -> Path:
     return CACHE_DIR / f"var_panel_{tag}_w{window}_a{alpha}.csv"
 
 
+def _combo_cache_path(
+    test_days: int | None, window: int, alpha: float, combination_window: int
+) -> Path:
+    """Cache for the dynamically combined panel, keyed by calibration window."""
+    tag = "full" if test_days is None else f"n{test_days}"
+    return CACHE_DIR / f"combo_panel_{tag}_w{window}_a{alpha}_c{combination_window}.csv"
+
+
 def build_panel(
     test_days: int | None = None,
     window: int = WINDOW,
@@ -434,12 +454,18 @@ def build_panel(
     refresh: bool = False,
     include_combinations: bool = True,
     verbose: bool = True,
+    combination_window: int = COMBINATION_WINDOW,
+    static_combinations: bool = False,
 ) -> tuple[pd.DataFrame, bool]:
     """Assemble the VaR panel, reusing a cached CSV when one is available.
 
     GARCH refitting on every rolling window is the expensive step, so the
-    stand-alone panel is cached; combination weights are cheap and refitted.
-    Returns ``(panel, from_cache)``.
+    stand-alone panel is cached; combination weights are re-estimated each run.
+
+    By default the combination weights are re-calibrated on a rolling
+    ``combination_window``-day window, so they adapt to regime shifts.  Passing
+    ``static_combinations=True`` restores the earlier single in-sample fit, which
+    is retained only for comparison.  Returns ``(panel, from_cache)``.
     """
     cache = _cache_path(test_days, window, alpha)
     returns = load_returns()
@@ -483,10 +509,67 @@ def build_panel(
         print(f"  rows dropped (NaN) : {dropped}")
 
     if include_combinations:
-        if verbose:
-            print("  fitting CQOM / CCOM combinations ...")
-        results = fit_combinations(panel, alpha=alpha)
-        panel = combined_frame(panel, results)
+        if static_combinations:
+            if verbose:
+                print("  fitting STATIC CQOM / CCOM combinations (in-sample) ...")
+            results = fit_combinations(panel, alpha=alpha)
+            panel = combined_frame(panel, results)
+        else:
+            if verbose:
+                print(
+                    f"  rolling CQOM / CCOM re-calibration "
+                    f"({combination_window}-day window) ..."
+                )
+            combo_cache = _combo_cache_path(
+                test_days, window, alpha, combination_window
+            )
+            weights_cache = combo_cache.with_name(
+                combo_cache.stem + "_weights.csv"
+            )
+            cached = None
+            if combo_cache.exists() and not refresh:
+                candidate = pd.read_csv(combo_cache, parse_dates=[DATE_COLUMN])
+                expected = {f"{VAR_COLUMN_PREFIX}{n}" for n in ("CQOM", "CCOM")}
+                if expected <= set(candidate.columns) and len(candidate) == len(
+                    panel
+                ) - combination_window:
+                    cached = candidate
+                    if verbose:
+                        print(f"  reusing combo cache: {combo_cache.name}")
+            if cached is not None:
+                panel = cached
+                if weights_cache.exists():
+                    panel.attrs["weights"] = pd.read_csv(
+                        weights_cache, parse_dates=[DATE_COLUMN]
+                    )
+            else:
+                rolled = rolling_combination_forecasts(
+                    panel,
+                    window=combination_window,
+                    alpha=alpha,
+                    progress_every=500 if verbose else 0,
+                )
+                panel = rolled.var_frame
+                if verbose:
+                    print(
+                        f"  re-calibrations    : {len(panel)} in "
+                        f"{rolled.elapsed_seconds:.1f}s  failures={rolled.failures}"
+                    )
+                    print(f"  invalid VaR >= 0   : {rolled.invalid}")
+                panel.attrs["weights"] = rolled.weights
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                out_c = panel.copy()
+                out_c[DATE_COLUMN] = pd.to_datetime(
+                    out_c[DATE_COLUMN]
+                ).dt.strftime("%Y-%m-%d")
+                out_c.to_csv(combo_cache, index=False)
+                wts = rolled.weights.copy()
+                wts[DATE_COLUMN] = pd.to_datetime(wts[DATE_COLUMN]).dt.strftime(
+                    "%Y-%m-%d"
+                )
+                wts.to_csv(weights_cache, index=False)
+            # Every model is now evaluated on the same common sample, since the
+            # combinations only begin once their own window is full.
     return panel, from_cache
 
 
@@ -592,6 +675,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alpha", type=float, default=ALPHA)
     parser.add_argument("--basel-window", type=int, default=BASEL_WINDOW)
     parser.add_argument("--refresh", action="store_true", help="ignore the cached panel")
+    parser.add_argument("--combination-window", type=int, default=COMBINATION_WINDOW,
+                        help="rolling window for dynamic CQOM/CCOM weights")
+    parser.add_argument("--static-combinations", action="store_true",
+                        help="use the old single in-sample weight fit instead")
     args = parser.parse_args(argv)
 
     print("=" * 78)
@@ -603,7 +690,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n[panel]")
     panel, from_cache = build_panel(
-        test_days=args.test_days, window=args.window, alpha=args.alpha, refresh=args.refresh
+        test_days=args.test_days, window=args.window, alpha=args.alpha,
+        refresh=args.refresh, combination_window=args.combination_window,
+        static_combinations=args.static_combinations,
     )
     dates = pd.to_datetime(panel[DATE_COLUMN])
     print(f"  out-of-sample S    : {len(panel)}")
@@ -664,11 +753,17 @@ def main(argv: list[str] | None = None) -> int:
             f"{counts.get(ZONE_RED, 0):>9}{len(valid):>9}"
         )
 
-    print("\n[caveat]")
-    print("  CQOM and CCOM weights are fitted on this same period, so their rows are an")
-    print("  IN-SAMPLE assessment (the paper's Tables 1-2). The paper's out-of-sample")
-    print("  assessment (Table 3) re-estimates the weights at each forecast date; that is")
-    print("  not what is reported here. HS / GARCH-N / GARCH-t are genuine out-of-sample.")
+    print("\n[weighting scheme]")
+    if args.static_combinations:
+        print("  STATIC: a single weight vector fitted over the whole period and applied to")
+        print("  every day. CQOM/CCOM rows are an IN-SAMPLE assessment (paper Tables 1-2)")
+        print("  and will flatter the combinations; they cannot be compared with the")
+        print("  stand-alone rows, which are genuinely out-of-sample.")
+    else:
+        print(f"  DYNAMIC: CQOM/CCOM weights re-calibrated every day on a rolling")
+        print(f"  {args.combination_window}-day window using only data from t-{args.combination_window} to t-1, mirroring the")
+        print("  paper's out-of-sample design (Table 3). All five models are now evaluated")
+        print("  out-of-sample on the same common sample, so the rows are comparable.")
 
     print("\n[sanity checks]")
     ok = tests_ok
