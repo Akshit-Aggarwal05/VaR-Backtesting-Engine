@@ -27,7 +27,27 @@ The core research question, taken directly from the source paper, is **whether o
 
 ![Model Validity Frontier](assets/model_validity_frontier.png)
 
-The engine uses **dynamic rolling-window weight calibration**: CQOM and CCOM re-estimate their loadings every single day on a rolling 250-day window, using only data from *t−250* to *t−1*. This replaced an earlier static scheme that fitted one weight vector over the whole sample, and it is what lets the combinations track a regime shift instead of carrying pre-crisis loadings into the crash. Every series below — stand-alone and combined alike — is therefore genuinely out-of-sample and evaluated on the same common period.
+### Methodological stance: strict rolling out-of-sample calibration
+
+This engine calibrates its combination weights under a **strict dynamic 250-day rolling window**. For every forecast date *t*, CQOM and CCOM re-solve for their optimal loadings using only data from *t−250* to *t−1*, and apply them to the stand-alone VaR vector at *t*. Because those stand-alone forecasts are themselves built only from returns before *t*, the combined VaR carries no lookahead at any point.
+
+Two deliberate departures from the source paper are worth stating precisely, because they change how the numbers should be read:
+
+- **The paper's headline combination tables (Tables 1–2) are an in-sample assessment** — weights fitted on the very window used to score them. Its out-of-sample assessment (Table 3) does re-estimate weights at each forecast point, so the paper is not purely in-sample; but its *best-looking* results are the in-sample ones, and those are the figures most often quoted.
+- **Where the paper re-estimates, it uses a recursive (expanding) window**, explicitly preferring it to a rolling one: *"Contrary to other studies, which apply a rolling window in the forecasting procedure, we use the recursive sampling window approach, which is able to preserve the valuable information issued by past extreme shocks."* A fixed rolling window is the harsher test: it deliberately discards distant history, so the model must re-learn tail behaviour from recent data alone rather than retaining a past crash in its estimation sample. This engine also applies that discipline across the **full 2002–2010 sample**, not the paper's shorter S = 653 crisis window.
+
+The result is a stricter standard than the paper's, applied uniformly to all five models.
+
+### What the stress test showed
+
+Under this rigorous out-of-sample crash stress test, **the dynamically calibrated CQOM model successfully adapted to the 2008 regime shift and maintained regulatory validity — Kupiec p = 0.0877, inside the Acceptance Zone.** Under the static scheme the identical model was rejected (p = 0.0273). The weights, not the model, were the binding constraint: forced to re-learn from the trailing 250 days, CQOM widened its loadings as volatility broke regime instead of carrying stale pre-crisis coefficients into the crash.
+
+Running the engine this way also surfaced **structural estimation constraints that in-sample reporting tends to mask**:
+
+- **The two GARCH inputs are near-collinear.** GARCH-Normal and GARCH-Student-t VaR are driven by the same conditional-volatility process and differ only in their quantile multiplier, so a quantile regression cannot cleanly separate them. The fitted loadings take large, near-perfectly offsetting values — swinging between −30 and +30 — and on 4 of 2,267 days produce an economically meaningless VaR ≥ 0. A single static fit averages this instability away; daily re-calibration exposes it.
+- **CCOM is weakly identified at α = 0.01.** Its method-of-moments objective is a step function of integer violation counts, and a 250-day window contains only ~2.5 expected violations, so a wide plateau of weight vectors ties at the optimum. CCOM consequently moved the *opposite* way to CQOM under dynamic weights (crash p 0.5576 → 0.0273). With ~2.1 expected violations in a 210-day crash window, the difference between 5 and 6 breaches flips the verdict — these are low-power tests, and neither direction should be over-read.
+
+Both effects are properties of the estimation problem, not defects introduced by the refactor, and both are invisible when weights are fitted once over the evaluation window.
 
 ### Crash period (2008-09-01 → 2009-07-01, S = 210)
 
