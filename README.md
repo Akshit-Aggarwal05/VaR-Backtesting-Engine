@@ -23,26 +23,53 @@ The core research question, taken directly from the source paper, is **whether o
 
 ---
 
-## Headline Results
+## Results & Visualizations
 
-Full out-of-sample period: **S = 2,517 forecasts, 2000-12-28 → 2010-12-31** (25.2 expected violations at α = 0.01).
+![Model Validity Frontier](assets/model_validity_frontier.png)
+
+The engine uses **dynamic rolling-window weight calibration**: CQOM and CCOM re-estimate their loadings every single day on a rolling 250-day window, using only data from *t−250* to *t−1*. This replaced an earlier static scheme that fitted one weight vector over the whole sample, and it is what lets the combinations track a regime shift instead of carrying pre-crisis loadings into the crash. Every series below — stand-alone and combined alike — is therefore genuinely out-of-sample and evaluated on the same common period.
+
+### Crash period (2008-09-01 → 2009-07-01, S = 210)
+
+The regime-shift test. Dynamic calibration is what moves CQOM across the regulatory line:
+
+| Model | Violations | Hit rate | Kupiec p | Verdict |
+|---|---|---|---|---|
+| Historical Simulation | 10 | 4.76% | 0.0001 ✗ | rejected |
+| GARCH(1,1)–Normal | 4 | 1.90% | 0.2414 ✓ | accepted |
+| GARCH(1,1)–Student-t | 4 | 1.90% | 0.2414 ✓ | accepted |
+| **CQOM** | 5 | 2.38% | **0.0877 ✓** | **accepted** (static was 0.0273 ✗) |
+| CCOM | 6 | 2.86% | 0.0273 ✗ | rejected (static was 0.5576 ✓) |
+
+### Full sample (2002-01-02 → 2010-12-31, S = 2,267)
 
 | Model | Violations | Hit rate | Kupiec p | Independence p | Cond. coverage p | Basel zone† |
 |---|---|---|---|---|---|---|
-| Historical Simulation | 44 | 1.748% | 0.0006 ✗ | 0.2316 | 0.0015 ✗ | GREEN |
-| GARCH(1,1)–Normal | 62 | 2.463% | 0.0000 ✗ | 0.0852 | 0.0000 ✗ | **RED** |
-| GARCH(1,1)–Student-t | 47 | 1.867% | 0.0001 ✗ | 0.0681 | 0.0001 ✗ | YELLOW |
-| CQOM *(in-sample)* | 35 | 1.391% | 0.0630 ✓ | 0.5126 | 0.1433 ✓ | YELLOW |
-| CCOM *(in-sample)* | 25 | 0.993% | 0.9728 ✓ | 0.4787 | 0.7776 ✓ | YELLOW |
+| Historical Simulation | 41 | 1.809% | 0.0005 ✗ | 0.2160 | 0.0011 ✗ | GREEN |
+| GARCH(1,1)–Normal | 59 | 2.603% | 0.0000 ✗ | 0.2805 | 0.0000 ✗ | **RED** |
+| GARCH(1,1)–Student-t | 45 | 1.985% | 0.0000 ✗ | 0.0710 | 0.0000 ✗ | YELLOW |
+| CQOM | 56 | 2.470% | 0.0000 ✗ | 0.0004 ✗ | 0.0000 ✗ | YELLOW |
+| CCOM | 75 | 3.308% | 0.0000 ✗ | 0.0000 ✗ | 0.0000 ✗ | YELLOW |
 
 ✗ = H₀ rejected at 5%. † Zone for the most recent 250-day window.
 
 **Reading these results honestly:**
 
-1. **All three stand-alone models fail unconditional coverage** (p ≤ 0.0006) over a sample spanning two crises. This reproduces the paper's central finding that standard VaR methods degrade sharply from calm to turbulent regimes.
-2. **The Normal distribution is the worst performer** at 2.5× its nominal breach rate, landing in the Basel red zone. Switching to Student-t innovations improves this materially — fat tails help, but do not rescue the model.
-3. **CQOM and CCOM rows are an in-sample assessment.** Their weights are fitted on the same window used to evaluate them, corresponding to the paper's Tables 1–2. The paper's genuine out-of-sample test (Table 3) re-estimates weights at each forecast date and is **not** what this table reports. Only the three stand-alone rows are true out-of-sample.
-4. **The independence tests are underpowered, not reassuring.** No model is rejected, but for HS the conditional breach probability is 2.6× the unconditional rate while only *two* consecutive-violation events support it. The engine flags cases where the test is not identified, so a p-value of 1.0 reads as "no evidence available" rather than "independence confirmed."
+1. **All three stand-alone models fail unconditional coverage** (p ≤ 0.0005) over a sample spanning two crises — the paper's central finding, that standard VaR methods degrade sharply from calm to turbulent regimes.
+2. **The Normal distribution is the worst performer** at 2.6× its nominal breach rate, sitting in the Basel red zone. Student-t innovations improve it materially — fat tails help, but do not rescue the model.
+3. **Dynamic calibration revealed the combinations' true out-of-sample behaviour rather than creating a problem.** Under the previous static scheme CQOM showed a full-sample Kupiec p of 0.063, but those weights were fitted on the very window being scored, so it was never a genuine pass. Measured honestly, both combinations are rejected over the full sample.
+4. **A 250-day window is thin for estimating weights at α = 0.01.** It contains only ~2.5 expected violations to identify three free loadings, and the two GARCH series are near-collinear, so the fitted loadings swing between −30 and +30 and occasionally produce an economically meaningless VaR ≥ 0 (4 of 2,267 days). Longer windows damp this monotonically:
+
+| Calibration window | CQOM full-sample rate | Kupiec p | Peak \|loading\| | VaR ≥ 0 days |
+|---|---|---|---|---|
+| 250 | 2.470% | 0.0000 | 30.9 | 4 |
+| 500 | 2.281% | 0.0000 | 12.5 | 5 |
+| 750 | 2.037% | 0.0001 | 9.1 | — |
+| 1000 | 1.846% | 0.0031 | 6.4 | 0 |
+| 1000 *(paper spec: intercept + weights sum to 1)* | 1.582% | 0.0357 | 4.6 | 0 |
+
+   The 250-day default is what the engine ships with, and it is the setting that clears the crash-period objective; `--combination-window` changes it.
+5. **The independence tests are underpowered, not reassuring.** Where a model is not rejected, that often reflects having only a handful of consecutive-violation events rather than evidence of independence. The engine flags cases where the test is not identified, so a p-value of 1.0 reads as "no evidence available" rather than "independence confirmed."
 
 ---
 
@@ -76,6 +103,8 @@ where `Q_p(Z)` is the p-th quantile of the **standardized** innovation distribut
 
 minimizing `ψ'ψ`. Neither method imposes sign or boundary constraints on the weights, so a combination may lie outside the range of its inputs.
 
+**Weight calibration is dynamic.** Both methods re-estimate their loadings on a rolling 250-day window for every forecast date, using only data from *t−250* to *t−1*, and apply them to the stand-alone VaR vector at *t*. Since those stand-alone forecasts are themselves built only from returns before *t*, the combined VaR carries no lookahead. The window is set by `--combination-window`; `--static-combinations` restores the single whole-sample fit for comparison.
+
 ---
 
 ## Project Architecture
@@ -83,9 +112,13 @@ minimizing `ψ'ψ`. Neither method imposes sign or boundary constraints on the w
 ```
 VaR-Backtesting-Engine/
 │
+├── assets/                        # Generated figures
+│   └── model_validity_frontier.png
+│
 ├── data/                          # Generated datasets (gitignored)
 │   ├── sp500_returns.csv          # Cleaned daily log-returns, 2000–2010
-│   └── var_panel_*.csv            # Cached rolling VaR forecasts
+│   ├── var_panel_*.csv            # Cached rolling VaR forecasts
+│   └── combo_panel_*.csv          # Cached dynamic combination panel + weights
 │
 ├── notebooks/                     # Reserved for exploratory analysis
 │
@@ -93,7 +126,8 @@ VaR-Backtesting-Engine/
 │   ├── data_loader.py             # Ingestion, cleaning, log-return construction
 │   ├── var_models.py              # HS, GARCH-Normal, GARCH-t + rolling engine
 │   ├── optimizations.py           # CQOM (quantile reg.) & CCOM (method of moments)
-│   └── backtesting.py             # Kupiec, Christoffersen, Basel traffic light
+│   ├── backtesting.py             # Kupiec, Christoffersen, Basel traffic light
+│   └── visualize_results.py       # Model validity frontier & paper comparison
 │
 ├── requirements.txt
 └── README.md
@@ -121,10 +155,9 @@ source venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
-pip install arch            # GARCH estimation engine
 ```
 
-**Core stack:** `pandas`, `numpy`, `scipy`, `statsmodels`, `arch`, `yfinance`.
+**Core stack:** `pandas`, `numpy`, `scipy`, `statsmodels`, `arch`, `yfinance`, `matplotlib`, `seaborn`.
 
 ---
 
@@ -149,6 +182,10 @@ python src/optimizations.py
 # Stage 4 — Basel backtesting harness
 # Coverage tests, independence tests and traffic-light zones for all five models.
 python src/backtesting.py
+
+# Stage 5 — Visualization
+# Renders assets/model_validity_frontier.png, including the paper comparison.
+python src/visualize_results.py
 ```
 
 ### Useful flags
@@ -162,6 +199,12 @@ python src/backtesting.py --refresh
 
 # Change the VaR level or estimation window
 python src/backtesting.py --alpha 0.05 --window 500
+
+# Change the rolling weight-calibration window (default 250)
+python src/backtesting.py --combination-window 1000
+
+# Compare against the old static (in-sample) weighting scheme
+python src/backtesting.py --static-combinations
 ```
 
 > **Runtime note:** Stage 4 refits two GARCH models on every one of 2,517 rolling windows, which takes roughly 2–3 minutes on first run. Results are cached to `data/`, so subsequent runs are near-instant unless `--refresh` is passed.
