@@ -26,9 +26,11 @@ which is binomial with parameter p under a correctly specified model.
 
   * **Basel traffic light.**  Zones are defined by quantiles of the
     Binomial(S=250, p=0.01) distribution (p. 1214): the green zone runs to the
-    95% quantile, the yellow zone from the 95% to the 99% quantile, and the red
-    zone beyond it.  ``verify_basel_thresholds`` checks the N<=4 / 5-9 / >=10
-    cut-offs against that distribution rather than hard-coding them on trust.
+    95% quantile and the red zone begins beyond the 99.99% quantile.  The paper
+    describes the red boundary as the "99% quantile", but that is loose prose --
+    it would imply a yellow ceiling of 6 and contradict the Basel Committee's
+    published table.  ``verify_basel_thresholds`` derives the N<=4 / 5-9 / >=10
+    cut-offs from the distribution rather than hard-coding them on trust.
 
 Numerical note: every log-likelihood uses ``scipy.special.xlogy``, which defines
 0*log(0) = 0.  Without it, the common cases N = 0 and N = S produce NaN instead
@@ -76,6 +78,7 @@ CACHE_DIR = PROJECT_ROOT / "data"
 
 # Basel Committee (1996) traffic-light cut-offs for S = 250, p = 0.01.
 BASEL_WINDOW = 250
+BASEL_ALPHA = 0.01      # the table is defined only for p = 0.01
 GREEN_MAX = 4
 YELLOW_MAX = 9
 
@@ -270,21 +273,37 @@ class BaselResult:
     start: object = None
     end: object = None
     sufficient: bool = True
+    reason: str = ""
 
 
 def basel_traffic_light(
     hits: np.ndarray | pd.Series,
     window: int = BASEL_WINDOW,
     dates: pd.Series | None = None,
+    alpha: float = ALPHA,
 ) -> BaselResult:
-    """Classify the most recent ``window`` days of the hit sequence."""
+    """Classify the most recent ``window`` days of the hit sequence.
+
+    The N<=4 / 5-9 / >=10 table is specific to S = 250 and p = 0.01, so the
+    classification is withheld (rather than silently mis-applied) when either
+    the sample is too short or ``alpha`` differs from the Basel level.
+    """
     h = _as_hits(hits)
+    if not np.isclose(alpha, BASEL_ALPHA):
+        return BaselResult(
+            zone=ZONE_INSUFFICIENT,
+            n_violations=int(h[-window:].sum()) if h.size >= window else int(h.sum()),
+            window=int(min(h.size, window)),
+            sufficient=False,
+            reason=f"Basel zones are defined for p={BASEL_ALPHA}, not {alpha}",
+        )
     if h.size < window:
         return BaselResult(
             zone=ZONE_INSUFFICIENT,
             n_violations=int(h.sum()),
             window=int(h.size),
             sufficient=False,
+            reason=f"only {h.size} observations, need {window}",
         )
     recent = h[-window:]
     start = end = None
@@ -360,7 +379,7 @@ def backtest_var(
     uc = kupiec_pof(hits, alpha)
     ind = christoffersen_independence(hits)
     cc = christoffersen_conditional_coverage(hits, alpha)
-    basel = basel_traffic_light(hits, window=basel_window, dates=dates)
+    basel = basel_traffic_light(hits, window=basel_window, dates=dates, alpha=alpha)
     return {
         "n_obs": int(hits.size),
         "n_violations": int(hits.sum()),
@@ -376,6 +395,8 @@ def backtest_var(
         "basel_zone": basel.zone,
         "basel_violations": basel.n_violations,
         "basel_window": basel.window,
+        "basel_applicable": basel.sufficient,
+        "basel_reason": basel.reason,
         **{f"trans_{k}": v for k, v in ind.detail.items() if k.startswith("n")},
     }
 
@@ -666,9 +687,13 @@ def main(argv: list[str] | None = None) -> int:
             and (table[["lr_uc", "lr_ind", "lr_cc"]].to_numpy() >= 0).all()
         ),
     )
+    valid_zones = [ZONE_GREEN, ZONE_YELLOW, ZONE_RED]
     ok &= _check(
-        "every Basel zone is a valid label",
-        bool(table["basel_zone"].isin([ZONE_GREEN, ZONE_YELLOW, ZONE_RED]).all()),
+        "every Basel zone is a valid label where the table applies",
+        bool(
+            table.loc[table["basel_applicable"], "basel_zone"].isin(valid_zones).all()
+            and (table.loc[~table["basel_applicable"], "basel_zone"] == ZONE_INSUFFICIENT).all()
+        ),
     )
     ok &= _check(
         "violation counts agree with an independent recomputation",
